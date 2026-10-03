@@ -1,4 +1,4 @@
-# ---------- 0) Utilities ----------
+# ---------- 1) Utilities ----------
 
 expit <- function(z) 1/(1+exp(-z))
 
@@ -15,36 +15,6 @@ dmu_fun <- function(eta, family) {
   }
   if (family == "poisson") return(exp(eta))
   stop("family must be 'logistic' or 'poisson'")
-}
-
-summarize_mc <- function(est_mat, true_psi) {
-  # est_mat: reps x p matrix
-  # true_psi: length p
-  stopifnot(ncol(est_mat) == length(true_psi))
-  
-  bias <- colMeans(est_mat - matrix(true_psi, nrow(est_mat), length(true_psi), byrow = TRUE), na.rm = TRUE)
-  sd   <- apply(est_mat, 2, sd, na.rm = TRUE)
-  mse  <- colMeans((est_mat - matrix(true_psi, nrow(est_mat), length(true_psi), byrow = TRUE))^2, na.rm = TRUE)
-  
-  data.frame(param = names(true_psi), truth = true_psi, bias = bias, sd = sd, mse = mse)
-}
-
-summarize_mc_with_ci <- function(est_mat, se_mat, true_psi) {
-  stopifnot(ncol(est_mat) == length(true_psi))
-  stopifnot(all(dim(est_mat) == dim(se_mat)))
-  
-  truth_mat <- matrix(true_psi, nrow(est_mat), length(true_psi), byrow = TRUE)
-  cover_mat <- (est_mat - 1.96 * se_mat <= truth_mat) & (truth_mat <= est_mat + 1.96 * se_mat)
-  
-  data.frame(
-    param = names(true_psi),
-    truth = true_psi,
-    bias = colMeans(est_mat - truth_mat, na.rm = TRUE),
-    sd = apply(est_mat, 2, sd, na.rm = TRUE),
-    mean_se = colMeans(se_mat, na.rm = TRUE),
-    coverage = colMeans(cover_mat, na.rm = TRUE),
-    mse = colMeans((est_mat - truth_mat)^2, na.rm = TRUE)
-  )
 }
 
 summarize_scalar_mc_with_ci <- function(est, se, truth) {
@@ -256,7 +226,7 @@ fit_methods_K_pkg <- function(Y, W, X, K, family, Pi, pi_vec,
   list(coef = coefs, vcov = vcovs)
 }
 
-# ---------- 1) Data generators ----------
+# ---------- 2) Data generators ----------
 
 simulate_binary <- function(n, family, alpha, gamma, pi, p01, p10) {
   # X: intercept + one covariate
@@ -330,189 +300,7 @@ estimate_K_misclass <- function(Z, W, K) {
   list(Pi = Pi_hat, pi = pi_hat)
 }
 
-# ---------- 2) Monte Carlo drivers ----------
-
-run_mc_binary <- function(reps = 100, n = 10000, family = "logistic",
-                          alpha = c(-0.5, 0.7), gamma = 0.8,
-                          pi = 0.4, p01 = 0.10, p10 = 0.15,
-                          known_probs = TRUE, val_frac = 0.25,
-                          drifting = FALSE, drift_scale = c(2, 2),
-                          include_simex = TRUE, simex_B = 25,
-                          simex_method = "improved",
-                          seed = 1) {
-  set.seed(seed)
-  
-  # If drifting = TRUE, use p01 = c01/sqrt(n) and p10 = c10/sqrt(n)
-  if (drifting) {
-    p01 <- drift_scale[1] / sqrt(n)
-    p10 <- drift_scale[2] / sqrt(n)
-  }
-  
-  true_psi <- c(gamma = gamma, alpha0 = alpha[1], alpha1 = alpha[2])
-  
-  # store estimates: array reps x methods x p
-  methods <- c("naive", "bca", "bcm", "cs", "cs_akn")
-  if (include_simex) methods <- c(methods, "simex")
-  est_arr <- array(NA_real_, dim = c(reps, length(methods), length(true_psi)),
-                   dimnames = list(NULL, methods, names(true_psi)))
-  se_arr <- est_arr
-  
-  for (b in 1:reps) {
-    dat <- simulate_binary(n, family, alpha, gamma, pi, p01, p10)
-    
-    # Choose misclassification params (oracle or plug-in from validation data)
-    if (known_probs) {
-      p01_use <- p01; p10_use <- p10; pi_use <- pi
-      fit <- fit_methods_binary_pkg(dat$Y, dat$W, dat$X, family, p01_use, p10_use, pi_use,
-                                    include_simex = include_simex, simex_B = simex_B,
-                                    simex_method = simex_method, simex_seed = seed + b)
-    } else {
-      # Validation subsample where true Z is observed.
-      # With val_frac fixed, p-hats are sqrt(n)-consistent: O_p(n^{-1/2}), which is stronger than o_p(n^{-1/4}).
-      idx_val <- sample.int(n, size = max(50, floor(val_frac * n)))
-      est <- estimate_binary_misclass(dat$Z[idx_val], dat$W[idx_val])
-      p01_use <- est$p01; p10_use <- est$p10; pi_use <- est$pi
-      
-      # protect against degenerate validation splits
-      if (!is.finite(p01_use) || !is.finite(p10_use) || !is.finite(pi_use)) {
-        next
-      }
-      fit <- fit_methods_binary_pkg(dat$Y, dat$W, dat$X, family, p01_use, p10_use, pi_use,
-                                    include_simex = include_simex, simex_B = simex_B,
-                                    simex_method = simex_method, simex_seed = seed + b,
-                                    validation = list(z = dat$Z[idx_val], index = idx_val))
-    }
-    
-    est_arr[b, , ] <- fit$coef[methods, names(true_psi), drop = FALSE]
-    for (m in methods) {
-      V <- fit$vcov[[m]]
-      if (!is.null(V) && all(dim(V) == c(length(true_psi), length(true_psi)))) {
-        se_arr[b, m, ] <- sqrt(pmax(diag(V[names(true_psi), names(true_psi), drop = FALSE]), 0))
-      }
-    }
-  }
-  
-  truth_arr <- array(rep(true_psi, each = reps * length(methods)),
-                     dim = dim(est_arr), dimnames = dimnames(est_arr))
-  cover_arr <- (est_arr - 1.96 * se_arr <= truth_arr) & (truth_arr <= est_arr + 1.96 * se_arr)
-  
-  # Return raw and summaries
-  list(
-    settings = list(reps = reps, n = n, family = family, alpha = alpha, gamma = gamma,
-                    pi = pi, p01 = p01, p10 = p10, known_probs = known_probs,
-                    drifting = drifting, include_simex = include_simex,
-                    simex_B = simex_B, simex_method = simex_method),
-    true_psi = true_psi,
-    est_arr  = est_arr,
-    se_arr = se_arr,
-    cover_arr = cover_arr
-  )
-}
-
-run_mc_K <- function(reps = 100, n = 10000, K = 3, family = "logistic",
-                     alpha = c(-0.3, 0.5), gamma_vec = c(0.7, -0.4),
-                     pi_vec = NULL, Pi = NULL,
-                     known_probs = TRUE, val_frac = 0.25,
-                     drifting = FALSE, drift_scale = 2,
-                     include_simex = TRUE, simex_B = 25,
-                     simex_method = "improved",
-                     seed = 1) {
-  set.seed(seed)
-  
-  if (is.null(pi_vec)) pi_vec <- rep(1 / K, K)
-  
-  if (is.null(Pi)) {
-    # default: symmetric misclassification
-    # P(correct) = 1 - p, P(misclass to any other) = p/(K-1)
-    p <- 0.20
-    if (drifting) p <- drift_scale / sqrt(n)
-    Pi <- matrix(p / (K - 1), nrow = K, ncol = K)
-    diag(Pi) <- 1 - p
-  }
-  
-  true_psi <- c(setNames(gamma_vec, paste0("gamma", 1:(K - 1))),
-                alpha0 = alpha[1], alpha1 = alpha[2])
-  
-  methods <- c("naive", "bca", "bcm", "cs", "cs_akn")
-  if (include_simex) methods <- c(methods, "simex")
-  est_arr <- array(NA_real_, dim = c(reps, length(methods), length(true_psi)),
-                   dimnames = list(NULL, methods, names(true_psi)))
-  se_arr <- est_arr
-  
-  for (b in 1:reps) {
-    dat <- simulate_K(n, K, family, alpha, gamma_vec, pi_vec, Pi)
-    
-    if (known_probs) {
-      Pi_use <- Pi; pi_use <- pi_vec
-    } else {
-      idx_val <- sample.int(n, size = max(80, floor(val_frac * n)))
-      est <- estimate_K_misclass(dat$Z[idx_val], dat$W[idx_val], K)
-      Pi_use <- est$Pi; pi_use <- est$pi
-      if (any(!is.finite(Pi_use)) || any(!is.finite(pi_use))) next
-    }
-    
-    fit <- fit_methods_K_pkg(dat$Y, dat$W, dat$X, K, family, Pi_use, pi_use,
-                             include_simex = include_simex, simex_B = simex_B,
-                             simex_method = simex_method, simex_seed = seed + b)
-    est_arr[b, , ] <- fit$coef[methods, names(true_psi), drop = FALSE]
-    for (m in methods) {
-      V <- fit$vcov[[m]]
-      if (!is.null(V) && all(dim(V) == c(length(true_psi), length(true_psi)))) {
-        se_arr[b, m, ] <- sqrt(pmax(diag(V[names(true_psi), names(true_psi), drop = FALSE]), 0))
-      }
-    }
-  }
-  
-  truth_arr <- array(rep(true_psi, each = reps * length(methods)),
-                     dim = dim(est_arr), dimnames = dimnames(est_arr))
-  cover_arr <- (est_arr - 1.96 * se_arr <= truth_arr) & (truth_arr <= est_arr + 1.96 * se_arr)
-  
-  list(
-    settings = list(reps = reps, n = n, K = K, family = family, alpha = alpha, gamma_vec = gamma_vec,
-                    pi_vec = pi_vec, Pi = Pi, known_probs = known_probs, drifting = drifting,
-                    include_simex = include_simex, simex_B = simex_B,
-                    simex_method = simex_method),
-    true_psi = true_psi,
-    est_arr  = est_arr,
-    se_arr = se_arr,
-    cover_arr = cover_arr
-  )
-}
-
-# ---------- 3) Convenience: print compact summaries ----------
-
-print_method_summaries <- function(mc_obj) {
-  est_arr <- mc_obj$est_arr
-  true_psi <- mc_obj$true_psi
-  
-  methods <- dimnames(est_arr)[[2]]
-  pnames  <- dimnames(est_arr)[[3]]
-  
-  cat("\n=== Monte Carlo summary ===\n")
-  print(mc_obj$settings)
-  cat("\nTrue parameters:\n")
-  print(true_psi)
-  
-  for (m in methods) {
-    est_mat <- est_arr[, m, , drop = FALSE]
-    est_mat <- matrix(est_mat, ncol = length(pnames))
-    colnames(est_mat) <- pnames
-    
-    cat("\n---", m, "---\n")
-    if (!is.null(mc_obj$se_arr)) {
-      se_mat <- mc_obj$se_arr[, m, , drop = FALSE]
-      se_mat <- matrix(se_mat, ncol = length(pnames))
-      colnames(se_mat) <- pnames
-      print(summarize_mc_with_ci(est_mat, se_mat, true_psi), row.names = FALSE)
-    } else {
-      print(summarize_mc(est_mat, true_psi), row.names = FALSE)
-    }
-  }
-  
-  invisible(NULL)
-}
-
-# ---------- 4) Combining probability and nonprobability samples ----------
+# ---------- 3) Combining probability and nonprobability samples ----------
 
 draw_nonprob_indices_by_x <- function(x, n_nonprob, nonprob_ratio) {
   n_large <- round(n_nonprob * nonprob_ratio)
@@ -588,7 +376,7 @@ naive_nonprob_mean_variance <- function(Y_sample) {
   if (n_sample > 1) stats::var(Y_sample) / n_sample else 0
 }
 
-run_comb_binary <- function(reps = 100, n = 10000, n_nonprob = 5000, n_prob = 1000, nonprob_ratio = 0.7,
+run_comb_binary <- function(reps = 100, n = 100000, n_nonprob = 10000, n_prob = 2000, nonprob_ratio = 0.7,
                             family = 'logistic', alpha = c(-0.5, 0.7), gamma = 0.8,
                             pi = 0.4, p01 = 0.1, p10 = 0.15,
                             known_probs = FALSE, val_frac = 0.1,
@@ -602,13 +390,13 @@ run_comb_binary <- function(reps = 100, n = 10000, n_nonprob = 5000, n_prob = 10
   mean_est <- matrix(NA_real_, nrow = reps, ncol = length(methods),
                      dimnames = list(NULL, methods))
   mean_se <- mean_est
-  truth <- rep(NA_real_, reps)
+  
+  population <- simulate_binary(n, family, alpha, gamma, pi, p01, p10)
+  truth <- mean(population$Y)
   
   for (b in 1:reps) {
-    population <- simulate_binary(n, family, alpha, gamma, pi, p01, p10)
     prob_idx <- sample.int(n, n_prob)
     nonprob_idx <- draw_nonprob_indices_by_x(population$X[, 2], n_nonprob, nonprob_ratio)
-    truth[b] <- mean(population$Y)
     
     # Choose correction parameters.
     if (known_probs) {
@@ -670,7 +458,7 @@ run_comb_binary <- function(reps = 100, n = 10000, n_nonprob = 5000, n_prob = 10
   )
 }
 
-run_comb_K <- function(reps = 100, n = 10000, n_nonprob = 5000, n_prob = 1000, nonprob_ratio = 0.7,
+run_comb_K <- function(reps = 100, n = 100000, n_nonprob = 10000, n_prob = 2000, nonprob_ratio = 0.7,
                        K = 3, family = "logistic",
                        alpha = c(-0.3, 0.5), gamma_vec = c(0.7, -0.4),
                        pi_vec = NULL, Pi = NULL,
@@ -696,13 +484,13 @@ run_comb_K <- function(reps = 100, n = 10000, n_nonprob = 5000, n_prob = 1000, n
   mean_est <- matrix(NA_real_, nrow = reps, ncol = length(methods),
                      dimnames = list(NULL, methods))
   mean_se <- mean_est
-  truth <- rep(NA_real_, reps)
+  
+  population <- simulate_K(n, K, family, alpha, gamma_vec, pi_vec, Pi)
+  truth <- mean(population$Y)
   
   for (b in 1:reps) {
-    population <- simulate_K(n, K, family, alpha, gamma_vec, pi_vec, Pi)
     prob_idx <- sample.int(n, n_prob)
     nonprob_idx <- draw_nonprob_indices_by_x(population$X[, 2], n_nonprob, nonprob_ratio)
-    truth[b] <- mean(population$Y)
     
     if (known_probs) {
       Pi_use <- Pi
@@ -786,7 +574,7 @@ print_comb_method_summaries <- function(mc_obj) {
   invisible(NULL)
 }
 
-# ---------- 5) Convenience: LaTeX tables ----------
+# ---------- 4) Convenience: LaTeX tables ----------
 
 latex_escape <- function(x) {
   x <- as.character(x)
@@ -856,34 +644,6 @@ latex_mass_header_label <- function(x) {
   latex_header_label(x)
 }
 
-coefficient_summary_df <- function(mc_obj) {
-  est_arr <- mc_obj$est_arr
-  true_psi <- mc_obj$true_psi
-  methods <- dimnames(est_arr)[[2]]
-  pnames <- dimnames(est_arr)[[3]]
-  
-  out <- list()
-  row_id <- 1
-  for (m in methods) {
-    est_mat <- matrix(est_arr[, m, , drop = FALSE], ncol = length(pnames))
-    colnames(est_mat) <- pnames
-    
-    if (!is.null(mc_obj$se_arr)) {
-      se_mat <- matrix(mc_obj$se_arr[, m, , drop = FALSE], ncol = length(pnames))
-      colnames(se_mat) <- pnames
-      tab <- summarize_mc_with_ci(est_mat, se_mat, true_psi)
-    } else {
-      tab <- summarize_mc(est_mat, true_psi)
-    }
-    
-    tab <- data.frame(method = m, tab, row.names = NULL)
-    out[[row_id]] <- tab
-    row_id <- row_id + 1
-  }
-  
-  do.call(rbind, out)
-}
-
 mass_summary_df <- function(mc_obj) {
   methods <- if (!is.null(mc_obj$mean_est)) colnames(mc_obj$mean_est) else dimnames(mc_obj$errors)[[2]]
   
@@ -941,20 +701,7 @@ latex_table_from_df <- function(tab, caption = NULL, label = NULL, digits = 3,
   paste(lines, collapse = "\n")
 }
 
-print_latex_method_summaries <- function(mc_obj, digits = 3, caption = NULL,
-                                         label = NULL, file = NULL,
-                                         table_env = TRUE) {
-  tex <- latex_table_from_df(coefficient_summary_df(mc_obj), caption = caption,
-                             label = label, digits = digits, table_env = table_env)
-  if (is.null(file)) {
-    cat(tex, "\n")
-  } else {
-    writeLines(tex, con = file)
-  }
-  invisible(tex)
-}
-
-print_latex_comb_method_summaries <- function(mc_obj, digits = 3, caption = NULL,
+print_latex_summaries <- function(mc_obj, digits = 3, caption = NULL,
                                               label = NULL, file = NULL,
                                               table_env = TRUE) {
   tex <- latex_table_from_df(mass_summary_df(mc_obj), caption = caption,
@@ -969,34 +716,20 @@ print_latex_comb_method_summaries <- function(mc_obj, digits = 3, caption = NULL
   invisible(tex)
 }
 
-print_latex_summaries <- function(mc_obj, digits = 3, caption = NULL,
-                                  label = NULL, file = NULL,
-                                  table_env = TRUE) {
-  if (!is.null(mc_obj$est_arr)) {
-    return(print_latex_method_summaries(mc_obj, digits = digits, caption = caption,
-                                        label = label, file = file,
-                                        table_env = table_env))
-  }
-  if (!is.null(mc_obj$errors) || !is.null(mc_obj$mean_est)) {
-    return(print_latex_comb_method_summaries(mc_obj, digits = digits, caption = caption,
-                                             label = label, file = file,
-                                             table_env = table_env))
-  }
-  stop("Unsupported simulation object.")
-}
 
 
 # ============================================================
 # Simulations:
-mc1 <- run_comb_binary(reps = 1000, n = 100000, n_nonprob = 10000, n_prob = 2000,
+
+mc1 <- run_comb_binary(reps = 1000, n = 1000000, n_nonprob = 10000, n_prob = 2000,
                        p01 = 0.15, p10 = 0.1, known_probs = FALSE, val_frac = 0.1)
-mc2 <- run_comb_binary(reps = 1000, n = 100000, n_nonprob = 10000, n_prob = 2000,
+mc2 <- run_comb_binary(reps = 1000, n = 1000000, n_nonprob = 10000, n_prob = 2000,
                        p01 = 0.2, p10 = 0.15, known_probs = FALSE, val_frac = 0.02)
-mc3 <- run_comb_binary(reps = 1000, n = 100000, n_nonprob = 10000, n_prob = 2000, gamma = 1.3, alpha = c(-1, 1.5),
+mc3 <- run_comb_binary(reps = 1000, n = 1000000, n_nonprob = 10000, n_prob = 2000, gamma = 1.3, alpha = c(-1, 1.5),
                        p01 = 0.4, p10 = 0.2, known_probs = FALSE, val_frac = 0.1)
-print_comb_method_summaries(mc1)
-print_comb_method_summaries(mc2)
-print_comb_method_summaries(mc3)
+# print_comb_method_summaries(mc1)
+# print_comb_method_summaries(mc2)
+# print_comb_method_summaries(mc3)
 # print_latex_summaries(mc1)
 # print_latex_summaries(mc2)
 # print_latex_summaries(mc3)
