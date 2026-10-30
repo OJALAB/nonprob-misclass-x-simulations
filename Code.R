@@ -2,6 +2,8 @@
 
 expit <- function(z) 1/(1+exp(-z))
 
+logit <- function(z) log(z/(1-z))
+
 mu_fun <- function(eta, family) {
   if (family == "logistic") return(expit(eta))
   if (family == "poisson")  return(exp(eta))
@@ -25,7 +27,8 @@ summarize_scalar_mc_with_ci <- function(est, se, truth) {
     sd = sd(est, na.rm = TRUE),
     mean_se = mean(se, na.rm = TRUE),
     coverage = mean(cover, na.rm = TRUE),
-    mse = mean((est - truth)^2, na.rm = TRUE)
+    mse = mean((est - truth)^2, na.rm = TRUE),
+    div = mean(is.na(est))
   )
 }
 
@@ -124,13 +127,12 @@ standardize_mcglm_K <- function(beta, V = NULL, K) {
   list(coef = beta_out, vcov = V_out)
 }
 
-fit_methods_binary_pkg <- function(Y, W, X, family, p01, p10, pi,
+fit_methods_binary_pkg <- function(Y, W, X, family, eta, 
                                    include_simex = TRUE, simex_B = 25,
                                    simex_method = "improved", simex_seed = 1, validation = NULL) {
   validate_mismeasured()
   mc <- mismeasured::mc
   
-  Pi <- binary_Pi(p01, p10)
   dat <- data.frame(Y = Y, W = factor(W, levels = 0:1), x1 = X[, 2])
   methods <- c("naive", "bca", "bcm", "cs", "cs_akn")
   pnames <- c("gamma", "alpha0", "alpha1")
@@ -140,13 +142,13 @@ fit_methods_binary_pkg <- function(Y, W, X, family, p01, p10, pi,
   vcovs <- setNames(vector("list", length(methods)), methods)
   if(is.null(validation)){
     fit <- tryCatch(
-      mismeasured::mcglm(Y ~ mc(W, Pi) + x1, data = dat, family = as_family_object(family),
-                         method = methods, pi_z = pi, vcov_corrected = TRUE),
+      mismeasured::mcglm(Y, z_hat = W, x = X, family = as_family_object(family),
+                         method = methods, eta = eta, vcov_corrected = TRUE),
       error = function(e) NULL
     )
   } else{
     fit <- mismeasured::mcglm(Y, z_hat = W, x = X, family = as_family_object(family), 
-                       method = methods, Pi = Pi, pi_z = pi, vcov_corrected = TRUE, validation = validation)
+                       method = methods, vcov_corrected = TRUE, validation = validation)
   }
   if (!is.null(fit)) {
     for (m in methods) {
@@ -184,7 +186,7 @@ fit_methods_K_pkg <- function(Y, W, X, K, family, Pi, pi_vec,
   mc <- mismeasured::mc
   
   dat <- data.frame(Y = Y, W = factor(W, levels = 0:(K - 1)), x1 = X[, 2])
-  methods <- c("naive", "bca", "bcm", "cs", "cs_akn")
+  methods <- c("naive", "bca", "ns", "cs", "cs_akn")
   pnames <- c(paste0("gamma", 1:(K - 1)), "alpha0", "alpha1")
   
   coefs <- matrix(NA_real_, nrow = length(methods), ncol = length(pnames),
@@ -228,13 +230,13 @@ fit_methods_K_pkg <- function(Y, W, X, K, family, Pi, pi_vec,
 
 # ---------- 2) Data generators ----------
 
-simulate_binary <- function(n, family, alpha, gamma, pi, p01, p10) {
+simulate_binary <- function(n, family, alpha, gamma, pi_z, impact_x_z, p01, p10, impact_x_p01, impact_x_p10) {
   # X: intercept + one covariate
   x1 <- rnorm(n)
   X  <- cbind(1, x1)
   
-  # latent Z independent of X
-  Z  <- rbinom(n, 1, pi)
+  rho_z <- expit(logit(pi_z) + impact_x_z * x1)
+  Z  <- rbinom(n, 1, rho_z)
   
   # outcome
   eta <- drop(X %*% alpha + gamma * Z)
@@ -245,18 +247,29 @@ simulate_binary <- function(n, family, alpha, gamma, pi, p01, p10) {
   W <- Z
   idx0 <- which(Z == 0)
   idx1 <- which(Z == 1)
-  if (length(idx0) > 0) W[idx0] <- rbinom(length(idx0), 1, p01)         # W=1 with prob p01, else 0
-  if (length(idx1) > 0) W[idx1] <- rbinom(length(idx1), 1, 1 - p10)     # W=1 with prob 1-p10, else 0
+  if (length(idx0) > 0) W[idx0] <- rbinom(length(idx0), 1, expit(logit(p01) + impact_x_p01 * x1[idx0]))
+  if (length(idx1) > 0) W[idx1] <- rbinom(length(idx1), 1, 1 - expit(logit(p10) + impact_x_p10 * x1[idx1]))
   
   list(Y = Y, X = X, Z = Z, W = W)
 }
 
-estimate_binary_misclass <- function(Z, W) {
-  # Estimates p01 = P(W=1|Z=0), p10 = P(W=0|Z=1), and pi = P(Z=1)
+estimate_binary_misclass <- function(Z, W, X) {
+  fit_rho <- glm(Z ~ X, family = binomial(link = "logit"))
+  eta_rho_hat <- coef(fit_rho)
+  
+  fit_01 <- glm(W ~ X, data = data.frame(W, X)[Z == 0, ], family = binomial(link = "logit"))
+  eta_01_hat <- coef(fit_01)
+  
+  W_inv <- 1 - W
+  fit_10 <- glm(W_inv ~ X, data = data.frame(W_inv, X)[Z == 1, ], 
+                family = binomial(link = "logit"))
+  eta_10_hat <- coef(fit_10)
+  
   p01_hat <- if (sum(Z == 0) > 0) mean(W[Z == 0] == 1) else NA_real_
   p10_hat <- if (sum(Z == 1) > 0) mean(W[Z == 1] == 0) else NA_real_
   pi_hat  <- mean(Z == 1)
-  list(p01 = p01_hat, p10 = p10_hat, pi = pi_hat)
+  list(p01 = p01_hat, p10 = p10_hat, pi_z = pi_hat,
+       eta_rho = eta_rho_hat, eta_01 = eta_01_hat, eta_10 = eta_10_hat)
 }
 
 simulate_K <- function(n, K, family, alpha, gamma_vec, pi_vec, Pi) {
@@ -297,23 +310,28 @@ estimate_K_misclass <- function(Z, W, K) {
     }
   }
   pi_hat <- as.numeric(table(factor(Z, levels = 0:(K - 1)))) / length(Z)
-  list(Pi = Pi_hat, pi = pi_hat)
+  list(Pi = Pi_hat, pi_z = pi_hat)
 }
 
 # ---------- 3) Combining probability and nonprobability samples ----------
 
-draw_nonprob_indices_by_x <- function(x, n_nonprob, nonprob_ratio) {
-  n_large <- round(n_nonprob * nonprob_ratio)
-  n_small <- n_nonprob - n_large
+draw_nonprob_indices_by_x_z <- function(x, z, n_nonprob, nonprob_ratio) {
+  n1 <- round(n_nonprob * nonprob_ratio^2)
+  n2 <- round(n_nonprob * nonprob_ratio * (1-nonprob_ratio))
+  n3 <- n_nonprob - n1 - 2*n2
   
-  idx_large <- which(x > 0)
-  idx_small <- which(x <= 0)
-  
-  if (n_large > length(idx_large) || n_small > length(idx_small)) {
+  idx_x_large_z_large <- which(x > 0 & z == 1)
+  idx_x_large_z_small <- which(x > 0 & z == 0)
+  idx_x_small_z_large <- which(x <= 0 & z == 1)
+  idx_x_small_z_small <- which(x <= 0 & z == 0)
+
+  if (n1 > length(idx_x_large_z_large) || n2 > length(idx_x_large_z_small)
+      || n2 > length(idx_x_small_z_large) || n3 > length(idx_x_small_z_small)) {
     stop("Requested nonprobability sample is larger than the available X strata.")
   }
   
-  c(sample(idx_small, n_small), sample(idx_large, n_large))
+  c(sample(idx_x_large_z_large, n1), sample(idx_x_large_z_small, n2),
+    sample(idx_x_small_z_large, n2), sample(idx_x_small_z_small, n3))
 }
 
 predict_binary_true_Z_mean <- function(Z, X, params, family = "logistic") {
@@ -378,44 +396,46 @@ naive_nonprob_mean_variance <- function(Y_sample) {
 
 run_comb_binary <- function(reps = 100, n = 100000, n_nonprob = 10000, n_prob = 2000, nonprob_ratio = 0.7,
                             family = 'logistic', alpha = c(-0.5, 0.7), gamma = 0.8,
-                            pi = 0.4, p01 = 0.1, p10 = 0.15,
+                            pi_z = 0.4, impact_x = 0, p01 = 0.1, p10 = 0.15, impact_x_p01 = 0, impact_x_p10 = 0,
                             known_probs = FALSE, val_frac = 0.1,
                             include_simex = TRUE, simex_B = 25,
                             simex_method = "improved", seed = 1){
   set.seed(seed)
   
   # store estimates: array reps x methods x p
-  methods <- c("gold", "naive", "naive MI", "bca", "bcm", "cs", "cs_akn")
+  methods <- c("gold", "naive", "naive MI", "bca", "ns", "cs", "cs_akn")
   if (include_simex) methods <- c(methods, "simex")
   mean_est <- matrix(NA_real_, nrow = reps, ncol = length(methods),
                      dimnames = list(NULL, methods))
   mean_se <- mean_est
   
-  population <- simulate_binary(n, family, alpha, gamma, pi, p01, p10)
+  population <- simulate_binary(n, family, alpha, gamma, pi_z, impact_x, p01, p10, impact_x_p01, impact_x_p10)
   truth <- mean(population$Y)
+  eta <- c(pi_z, impact_x, p01, impact_x_p01, p10, impact_x_p10)
   
   for (b in 1:reps) {
     prob_idx <- sample.int(n, n_prob)
-    nonprob_idx <- draw_nonprob_indices_by_x(population$X[, 2], n_nonprob, nonprob_ratio)
-    
+    nonprob_idx <- draw_nonprob_indices_by_x_z(population$X[, 2], population$Z, n_nonprob, nonprob_ratio)
     # Choose correction parameters.
     if (known_probs) {
-      p01_use <- p01; p10_use <- p10; pi_use <- pi
       validation <- NULL
     } else {
       val_size <- min(length(nonprob_idx), max(50, floor(val_frac * length(nonprob_idx))))
       idx_val <- sample(n_nonprob, size = val_size)
-      est <- estimate_binary_misclass(population$Z[nonprob_idx][idx_val], population$W[nonprob_idx][idx_val])
-      p01_use <- est$p01; p10_use <- est$p10; pi_use <- est$pi
+      # est <- estimate_binary_misclass(population$Z[nonprob_idx][idx_val],
+      #                                 population$W[nonprob_idx][idx_val], population$X[nonprob_idx][idx_val])
+      # p01_use <- est$p01; p10_use <- est$p10; pi_use <- est$pi_z
       validation <- list(z = population$Z[nonprob_idx][idx_val], index = idx_val)
+      # idx_val <- sample(n, size = val_size)
+      # est <- estimate_binary_misclass(population$Z[idx_val], population$W[idx_val])
+      # p01_use <- est$p01; p10_use <- est$p10; pi_use <- est$pi_z
+      # validation <- list(z = population$Z[idx_val], z_hat = population$W[idx_val])
     }
-    
-    if (!is.finite(p01_use) || !is.finite(p10_use) || !is.finite(pi_use)) next
     
     fit <- fit_methods_binary_pkg(population$Y[nonprob_idx],
                                   population$W[nonprob_idx],
                                   population$X[nonprob_idx, , drop = FALSE],
-                                  family, p01_use, p10_use, pi_use,
+                                  family, eta,
                                   include_simex = include_simex, simex_B = simex_B,
                                   simex_method = simex_method, simex_seed = seed + b, validation = validation)
     
@@ -427,7 +447,7 @@ run_comb_binary <- function(reps = 100, n = 100000, n_nonprob = 10000, n_prob = 
         mean_est[b, i] <- mean(population$Y[nonprob_idx])
         mean_se[b, i] <- sqrt(naive_nonprob_mean_variance(population$Y[nonprob_idx]))
       } else {
-        fit_method <- if (i == "naive MI") "naive" else i
+        fit_method <- if (i == "naive MI") "naive" else if (i == 'ns') "bcm" else i
         params <- fit$coef[fit_method, ]
         mean_est[b, i] <- mean(predict_binary_true_Z_mean(population$Z[prob_idx],
                                                           population$X[prob_idx, , drop = FALSE],
@@ -446,7 +466,7 @@ run_comb_binary <- function(reps = 100, n = 100000, n_nonprob = 10000, n_prob = 
   # Return raw and summaries
   list(
     settings = list(reps = reps, n = n, n_prob = n_prob, n_nonprob = n_nonprob, family = family,
-                    alpha = alpha, gamma = gamma, pi = pi, p01 = p01, p10 = p10,
+                    alpha = alpha, gamma = gamma, pi_z = pi_z, p01 = p01, p10 = p10,
                     nonprob_ratio = nonprob_ratio, known_probs = known_probs, val_frac = val_frac,
                     include_simex = include_simex, simex_B = simex_B,
                     simex_method = simex_method),
@@ -479,7 +499,7 @@ run_comb_K <- function(reps = 100, n = 100000, n_nonprob = 10000, n_prob = 2000,
   stopifnot(length(pi_vec) == K)
   stopifnot(all(dim(Pi) == c(K, K)))
   
-  methods <- c("gold", "naive", "naive MI", "bca", "bcm", "cs", "cs_akn")
+  methods <- c("gold", "naive", "naive MI", "bca", "ns", "cs", "cs_akn")
   if (include_simex) methods <- c(methods, "simex")
   mean_est <- matrix(NA_real_, nrow = reps, ncol = length(methods),
                      dimnames = list(NULL, methods))
@@ -490,7 +510,7 @@ run_comb_K <- function(reps = 100, n = 100000, n_nonprob = 10000, n_prob = 2000,
   
   for (b in 1:reps) {
     prob_idx <- sample.int(n, n_prob)
-    nonprob_idx <- draw_nonprob_indices_by_x(population$X[, 2], n_nonprob, nonprob_ratio)
+    nonprob_idx <- draw_nonprob_indices_by_x_z(population$X[, 2], population$Z, n_nonprob, nonprob_ratio)
     
     if (known_probs) {
       Pi_use <- Pi
@@ -500,7 +520,7 @@ run_comb_K <- function(reps = 100, n = 100000, n_nonprob = 10000, n_prob = 2000,
       idx_val <- sample(nonprob_idx, size = val_size)
       est <- estimate_K_misclass(population$Z[idx_val], population$W[idx_val], K)
       Pi_use <- est$Pi
-      pi_use <- est$pi
+      pi_use <- est$pi_z
     }
     
     if (any(!is.finite(Pi_use)) || any(!is.finite(pi_use))) next
@@ -520,7 +540,7 @@ run_comb_K <- function(reps = 100, n = 100000, n_nonprob = 10000, n_prob = 2000,
         mean_est[b, i] <- mean(population$Y[nonprob_idx])
         mean_se[b, i] <- sqrt(naive_nonprob_mean_variance(population$Y[nonprob_idx]))
       } else {
-        fit_method <- if (i == "naive MI") "naive" else i
+        fit_method <- if (i == "naive MI") "naive" else if (i == "ns") "bcm" else i
         params <- fit$coef[fit_method, ]
         mean_est[b, i] <- mean(predict_K_true_Z_mean(population$Z[prob_idx],
                                                      population$X[prob_idx, , drop = FALSE],
@@ -559,7 +579,7 @@ print_comb_method_summaries <- function(mc_obj) {
   if (!is.null(mc_obj$mean_est) && !is.null(mc_obj$mean_se)) {
     out <- t(vapply(methods, function(m) {
       summarize_scalar_mc_with_ci(mc_obj$mean_est[, m], mc_obj$mean_se[, m], mc_obj$true_mean)
-    }, numeric(6)))
+    }, numeric(7)))
     out <- data.frame(method = rownames(out), out, row.names = NULL)
     print(out, row.names = FALSE)
     return(invisible(NULL))
@@ -569,8 +589,9 @@ print_comb_method_summaries <- function(mc_obj) {
   bias <- colMeans(errors, na.rm = TRUE)
   sd   <- apply(errors, 2, sd, na.rm = TRUE)
   mse  <- colMeans(errors^2, na.rm = TRUE)
+  div <- colSums(is.na(errors))
   
-  print(data.frame(method = methods, bias = bias, sd = sd, mse = mse), row.names = F)
+  print(data.frame(method = methods, bias = bias, sd = sd, mse = mse, div = div), row.names = F)
   invisible(NULL)
 }
 
@@ -650,7 +671,7 @@ mass_summary_df <- function(mc_obj) {
   if (!is.null(mc_obj$mean_est) && !is.null(mc_obj$mean_se)) {
     out <- t(vapply(methods, function(m) {
       summarize_scalar_mc_with_ci(mc_obj$mean_est[, m], mc_obj$mean_se[, m], mc_obj$true_mean)
-    }, numeric(6)))
+    }, numeric(7)))
     return(data.frame(method = rownames(out), out, row.names = NULL))
   }
   
@@ -721,15 +742,17 @@ print_latex_summaries <- function(mc_obj, digits = 3, caption = NULL,
 # ============================================================
 # Simulations:
 
-mc1 <- run_comb_binary(reps = 1000, n = 1000000, n_nonprob = 10000, n_prob = 2000,
-                       p01 = 0.15, p10 = 0.1, known_probs = FALSE, val_frac = 0.1)
-mc2 <- run_comb_binary(reps = 1000, n = 1000000, n_nonprob = 10000, n_prob = 2000,
-                       p01 = 0.2, p10 = 0.15, known_probs = FALSE, val_frac = 0.02)
-mc3 <- run_comb_binary(reps = 1000, n = 1000000, n_nonprob = 10000, n_prob = 2000, gamma = 1.3, alpha = c(-1, 1.5),
-                       p01 = 0.4, p10 = 0.2, known_probs = FALSE, val_frac = 0.1)
-# print_comb_method_summaries(mc1)
-# print_comb_method_summaries(mc2)
-# print_comb_method_summaries(mc3)
+mc1 <- run_comb_binary(reps = 1000, n = 1000000, n_nonprob = 10000, n_prob = 2000, impact_x = 0.2, include_simex = F,
+                       p01 = 0.15, p10 = 0.1, impact_x_p10 = 0.1, known_probs = F, val_frac = 0.1)
+mc2 <- run_comb_binary(reps = 1000, n = 1000000, n_nonprob = 10000, n_prob = 2000, impact_x = 0.2, include_simex = F,
+                       p01 = 0.2, p10 = 0.15, impact_x_p10 = 0.1, known_probs = FALSE, val_frac = 0.02)
+mc3 <- run_comb_binary(reps = 1000, n = 1000000, n_nonprob = 10000, n_prob = 2000, impact_x = 0.2, include_simex = F,
+                       gamma = 1.3, alpha = c(-1, 1.5),
+                       p01 = 0.4, p10 = 0.3, impact_x_p10 = 0.3, known_probs = F, val_frac = 0.1)
+print_comb_method_summaries(mc1)
+print_comb_method_summaries(mc2)
+print_comb_method_summaries(mc3)
+
 # print_latex_summaries(mc1)
 # print_latex_summaries(mc2)
 # print_latex_summaries(mc3)
